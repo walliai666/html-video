@@ -247,6 +247,40 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         return json(res, 200, { project: await ctx.orchestrator.load(project.id) });
       }
 
+      // Frame-specific raw HTML — keeps frames[] intact (writePreviewHtmlRaw
+      // resets the storyboard, which is wrong for multi-frame edits).
+      const frameRawMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/frames\/([^/]+)\/raw-html$/);
+      if (frameRawMatch && frameRawMatch[1] && frameRawMatch[2]) {
+        const projId = frameRawMatch[1];
+        const nodeId = frameRawMatch[2];
+        if (m === 'GET') {
+          const project = await ctx.orchestrator.load(projId);
+          const frame = (project.frames ?? []).find((f) => f.graphNodeId === nodeId);
+          if (!frame || !existsSync(frame.htmlPath)) {
+            return json(res, 404, { error: `Frame ${nodeId} not found` });
+          }
+          const html = await readFile(frame.htmlPath, 'utf8');
+          res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+          res.end(html);
+          return;
+        }
+        if (m === 'PUT') {
+          const ct = req.headers['content-type'] ?? '';
+          let html: string;
+          if (ct.includes('application/json')) {
+            const body = await readBody(req);
+            html = (body.html as string) ?? '';
+          } else {
+            html = await readBodyText(req);
+          }
+          if (!html || !/<\/html>/i.test(html)) {
+            return json(res, 400, { error: 'Body must be a complete HTML document' });
+          }
+          await ctx.orchestrator.writeFrameHtml(projId, nodeId, html);
+          return json(res, 200, { ok: true });
+        }
+      }
+
       // Export MP4
       const expMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/export$/);
       if (expMatch && expMatch[1] && m === 'POST') {

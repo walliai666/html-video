@@ -165,9 +165,18 @@ export class ProjectOrchestrator {
     const htmlPath = join(projectDir, 'preview.html');
     await writeFile(htmlPath, html, 'utf8');
     project.lastPreviewHtmlPath = htmlPath;
-    // Single-frame path supersedes any previous multi-frame state.
-    project.frames = [];
-    delete project.contentGraphPath;
+    // v0.8.2: only treat this as a "supersedes the storyboard" event for
+    // truly fresh single-frame projects (no frames yet). For projects that
+    // already have a storyboard, the single-frame raw write is treated as
+    // an in-place inline edit on the active preview file — frames[] /
+    // contentGraphPath are preserved so the user doesn't lose their
+    // storyboard if they happen to use a single-frame iteration on a
+    // multi-frame project. (Frame-specific in-place edits should go
+    // through writeFrameHtml instead.)
+    if ((project.frames?.length ?? 0) === 0) {
+      project.frames = [];
+      delete project.contentGraphPath;
+    }
     if (project.status === 'draft') project.status = 'previewed';
     await this.deps.projects.save(project);
     return { project, htmlPath };

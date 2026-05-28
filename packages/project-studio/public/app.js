@@ -30,6 +30,7 @@ const state = {
   // v0.8: multi-frame timeline state
   activeFrameId: null,     // graphNodeId currently shown in iframe
   iterateFocusFrameId: null, // graphNodeId iterations should target only (null = whole video)
+  editTextMode: false,     // when true, preview iframe accepts inline text edits
   lastGraph: null,         // last fetched ContentGraph (for download)
 };
 
@@ -96,6 +97,8 @@ async function selectProject(id) {
   state.selectedId = id;
   state.selected = (await API.getProject(id)).project;
   state.activeFrameId = null;  // reset frame selection on project switch
+  state.iterateFocusFrameId = null;
+  state.editTextMode = false;
   try { state.messages = (await API.getMessages(id)).messages ?? []; }
   catch { state.messages = []; }
   renderSidebar();
@@ -1041,12 +1044,169 @@ function renderPreview() {
   const stamp = sortedFrames.length > 0 && state.activeFrameId
     ? state.activeFrameId
     : (p.templateId || '');
-  stage.innerHTML = `<div class="preview-frame">
-    <iframe id="preview-iframe" sandbox="allow-scripts" src="${iframeSrc}"></iframe>
+  // sandbox now grants same-origin so we can attach a text-edit overlay
+  // from the parent window. allow-scripts keeps the page's own animations
+  // running. forms / popups / top-navigation stay blocked.
+  stage.innerHTML = `<div class="preview-frame ${state.editTextMode ? 'editing' : ''}">
+    <iframe id="preview-iframe" sandbox="allow-scripts allow-same-origin" src="${iframeSrc}"></iframe>
     ${stamp ? `<div class="stamp">${esc(stamp)}</div>` : ''}
+    <button class="edit-toggle" id="btn-edit-text"
+      title="${state.editTextMode ? '完成编辑' : '点击文字直接修改'}">
+      ${state.editTextMode ? '✓ 完成编辑' : '✎ 编辑文字'}
+    </button>
   </div>`;
   attachPreviewScaler();
+  const editBtn = document.getElementById('btn-edit-text');
+  if (editBtn) editBtn.onclick = togglePreviewEdit;
+  // If the user just toggled into edit mode, attach the overlay once the
+  // iframe loads. If already in edit mode and we re-rendered, attach now
+  // (iframe might already be loaded when reusing a cached preview).
+  const iframe = document.getElementById('preview-iframe');
+  if (iframe && state.editTextMode) {
+    if (iframe.contentDocument && iframe.contentDocument.readyState === 'complete') {
+      attachTextEditOverlay(iframe);
+    } else {
+      iframe.addEventListener('load', () => attachTextEditOverlay(iframe), { once: true });
+    }
+  }
   renderFramesStrip();
+}
+
+function togglePreviewEdit() {
+  state.editTextMode = !state.editTextMode;
+  // When leaving edit mode, force-reload preview so any in-iframe styling
+  // is dropped cleanly.
+  renderPreview();
+}
+
+// Inject hover highlight + click-to-edit on every [data-hv-text] node in
+// the preview iframe. On commit we replace text content in the iframe DOM,
+// serialize it, and PUT to the right endpoint (frame-specific or whole-
+// project preview).
+function attachTextEditOverlay(iframe) {
+  let doc;
+  try { doc = iframe.contentDocument; } catch { return; }
+  if (!doc) return;
+  // Idempotent: tear down any prior overlay first.
+  doc.querySelectorAll('[data-hv-edit-style]').forEach((el) => el.remove());
+  const style = doc.createElement('style');
+  style.setAttribute('data-hv-edit-style', '');
+  style.textContent = `
+    [data-hv-text] { outline: 1px dashed rgba(201, 100, 66, .6) !important;
+      outline-offset: 3px !important; cursor: text !important;
+      transition: outline-color .12s, background .12s; }
+    [data-hv-text]:hover { outline: 2px solid rgb(201, 100, 66) !important;
+      background: rgba(201, 100, 66, .08) !important; }
+    [data-hv-text][contenteditable="true"] { outline: 2px solid rgb(201, 100, 66) !important;
+      outline-offset: 3px !important; background: rgba(201, 100, 66, .12) !important; }
+  `;
+  (doc.head || doc.documentElement).appendChild(style);
+
+  let dirty = false;
+  const enableEdit = (el) => {
+    if (el.getAttribute('contenteditable') === 'true') return;
+    el.setAttribute('contenteditable', 'true');
+    el.focus();
+    // Place caret at end
+    const range = doc.createRange();
+    range.selectNodeContents(el);
+    range.collapse(false);
+    const sel = doc.getSelection();
+    if (sel) { sel.removeAllRanges(); sel.addRange(range); }
+  };
+  const finishEdit = async (el) => {
+    if (el.getAttribute('contenteditable') !== 'true') return;
+    el.removeAttribute('contenteditable');
+    if (!dirty) return;
+    dirty = false;
+    await commitTextEdits(iframe);
+  };
+
+  doc.addEventListener('click', (e) => {
+    const target = e.target.closest('[data-hv-text]');
+    if (!target) return;
+    e.preventDefault();
+    e.stopPropagation();
+    enableEdit(target);
+  }, true);
+  doc.addEventListener('input', (e) => {
+    if (e.target.closest && e.target.closest('[data-hv-text]')) {
+      dirty = true;
+    }
+  });
+  doc.addEventListener('keydown', (e) => {
+    const target = e.target.closest && e.target.closest('[data-hv-text][contenteditable="true"]');
+    if (!target) return;
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); target.blur(); }
+    if (e.key === 'Escape') { e.preventDefault(); target.blur(); }
+  });
+  doc.addEventListener('focusout', (e) => {
+    const t = e.target;
+    if (t && t.matches && t.matches('[data-hv-text][contenteditable="true"]')) {
+      finishEdit(t);
+    }
+  }, true);
+}
+
+async function commitTextEdits(iframe) {
+  if (!state.selected) return;
+  const projectId = state.selected.id;
+  const fid = state.activeFrameId;
+  const url = fid
+    ? `/api/projects/${projectId}/frames/${encodeURIComponent(fid)}/raw-html`
+    : `/api/projects/${projectId}/raw-html`;
+  // Read the current frame HTML from disk, walk its [data-hv-text] nodes,
+  // sync each one's text from the iframe DOM. We do server-side merging
+  // on the client to keep it simple.
+  let serverHtml;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`fetch failed ${r.status}`);
+    serverHtml = await r.text();
+  } catch (e) {
+    toast(`保存失败：${e.message}`, 'error');
+    return;
+  }
+  const parser = new DOMParser();
+  const target = parser.parseFromString(serverHtml, 'text/html');
+  const live = iframe.contentDocument;
+  const liveByKey = new Map();
+  if (live) {
+    live.querySelectorAll('[data-hv-text]').forEach((el) => {
+      const k = el.getAttribute('data-hv-text');
+      if (k) liveByKey.set(k, el.textContent ?? '');
+    });
+  }
+  let changed = 0;
+  target.querySelectorAll('[data-hv-text]').forEach((el) => {
+    const k = el.getAttribute('data-hv-text');
+    if (!k || !liveByKey.has(k)) return;
+    const newText = liveByKey.get(k);
+    if (el.textContent !== newText) {
+      el.textContent = newText;
+      changed += 1;
+    }
+  });
+  if (changed === 0) return;
+  // Serialize the doc + ship it back.
+  const out = '<!doctype html>\n' + target.documentElement.outerHTML;
+  try {
+    const r = await fetch(url, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ html: out }),
+    });
+    if (!r.ok) throw new Error(`save failed ${r.status}`);
+    toast(`已保存 ${changed} 处修改`, 'success');
+    // Refresh local project state so frames-strip thumbnails cache-bust.
+    if (fid) {
+      const pr = await API.getProject(projectId);
+      state.selected = pr.project;
+      renderFramesStrip();
+    }
+  } catch (e) {
+    toast(`保存失败：${e.message}`, 'error');
+  }
 }
 
 // Keep --preview-scale on .preview-frame in sync with its rendered width
