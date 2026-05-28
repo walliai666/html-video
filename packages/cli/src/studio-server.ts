@@ -464,6 +464,49 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
             `[studio:msg] proj=${id} phase=${phaseInfo.phase} done in ${elapsedMs}ms exit=${exitInfo.exitCode} text=${assistantText.length}B chunks=${textChunks}\n`,
           );
 
+          // Empty-reply retry: if the agent returned almost nothing AND we
+          // were on the iterate path with prior HTML, try a tighter prompt
+          // that only ships the user's request + a tiny instruction. This
+          // catches the 6-8KB-prompt empty-reply mode.
+          if (assistantText.trim().length < 32 && phaseInfo.phase === 'iterate' && priorHtml) {
+            sseWrite({ type: 'text', chunk: '\n↻ 第一次输出为空，重试中…\n' });
+            // Retry without inlining the prior HTML — same observation as
+            // the iterate prompt itself: claude --print silently no-ops
+            // when fed multi-KB of HTML to rewrite.
+            const sum = summariseHtmlForIterate(priorHtml);
+            const retryPrompt = [
+              `Output ONE complete \`\`\`html block — full self-contained 1920×1080 page. Nothing else.`,
+              ``,
+              `User request: ${userText.slice(0, 300)}`,
+              sum.headline ? `Headline: ${sum.headline}` : '',
+              sum.subheads.length ? `Subheads:\n${sum.subheads.slice(0, 4).map((s) => `  · ${s}`).join('\n')}` : '',
+              sum.bgColors.length ? `Palette: ${sum.bgColors.join(' / ')}` : '',
+              sum.fontFamilies.length ? `Fonts: ${sum.fontFamilies.join(', ')}` : '',
+              ``,
+              `Begin reply with \`\`\`html. Tag visible text with data-hv-text. No prose outside the block.`,
+            ].filter(Boolean).join('\n');
+            let retryText = '';
+            const retryHandle = spawnAgent({
+              def: agentDef,
+              prompt: retryPrompt,
+              context: { cwd: projectDir },
+              onEvent: (ev) => {
+                if (ev.type === 'text') {
+                  retryText += ev.chunk;
+                  textChunks += 1;
+                  sseWrite(ev);
+                } else if (ev.type === 'error' || ev.type === 'message_end') {
+                  sseWrite(ev);
+                }
+              },
+            });
+            await retryHandle.done;
+            assistantText += retryText;
+            process.stderr.write(
+              `[studio:msg] proj=${id} retry done text=${retryText.length}B\n`,
+            );
+          }
+
           // Single-frame iterate: result HTML goes back to the focused frame
           // only — never overwrites the whole preview.html.
           if (focusFrameId) {
@@ -1419,17 +1462,19 @@ h1{font-size:8vw;letter-spacing:-.03em;animation:in 1.2s ease forwards;opacity:0
   }
 
   // ---- iterate: post-generation free-form revision ----
-  // Tight prompt: agent should treat user's text as a revision instruction
-  // applied to the existing HTML — either the whole-video preview, or a
-  // single focused frame when focusFrameId is set.
+  // claude --print is unreliable when fed 6KB+ of HTML and asked to emit
+  // 6KB+ back — it silently no-ops in ~50% of attempts. Instead of feeding
+  // the whole HTML, we extract the visible text + style summary and let
+  // the model REWRITE rather than EDIT. Output is bounded by the same
+  // skeleton trick used by generate-phase.
   const it: string[] = [];
   if (args.focusFrameId) {
-    it.push(`The user has pinned frame "${args.focusFrameId}" and wants to revise ONLY that frame. Apply their revision request to the frame HTML below. Do NOT touch any other frame in the project. Keep the existing visual identity (colours / typography / motion vocabulary) unless the user explicitly asks for a different look.`);
+    it.push(`The user has pinned frame "${args.focusFrameId}" and wants to revise ONLY that frame. Apply their request below — write a fresh complete HTML page that delivers the same content, in roughly the same visual style, but with the requested change.`);
   } else {
-    it.push(`The user is iterating on an existing HTML video. Apply their revision request below to the prior preview HTML, keeping the visual identity unless they ask for a different one.`);
+    it.push(`The user is iterating on an existing HTML video. Apply their request below — write a fresh complete HTML page that delivers the same content, in roughly the same visual style, but with the requested change.`);
   }
   it.push('');
-  it.push(`# User revision request`);
+  it.push(`# User request`);
   it.push(userText);
   it.push('');
   if (attachments.length > 0) {
@@ -1438,16 +1483,77 @@ h1{font-size:8vw;letter-spacing:-.03em;animation:in 1.2s ease forwards;opacity:0
     it.push('');
   }
   if (baseHtml) {
-    it.push(args.focusFrameId
-      ? `# Frame "${args.focusFrameId}" HTML (this is the ONLY frame you should rewrite)`
-      : `# Prior preview HTML`);
-    it.push('```html');
-    it.push(baseHtml.slice(0, 6000));
-    it.push('```');
+    // IMPORTANT: do NOT inline the raw HTML. Empirically, including 6-8KB
+    // of reference HTML in an iterate prompt makes `claude --print` return
+    // 1 byte ~70% of the time (verified by hand). A summary of the
+    // existing content + palette is enough to anchor a clean rewrite.
+    const summary = summariseHtmlForIterate(baseHtml);
+    it.push(`# Current frame — what's there now`);
+    if (summary.headline) it.push(`Headline: ${summary.headline}`);
+    if (summary.subheads.length) it.push(`Sub-text:\n${summary.subheads.map((s) => `  · ${s}`).join('\n')}`);
+    if (summary.dataPoints.length) it.push(`Data points:\n${summary.dataPoints.map((s) => `  · ${s}`).join('\n')}`);
+    if (summary.bgColors.length) it.push(`Palette: ${summary.bgColors.join(' / ')}`);
+    if (summary.fontFamilies.length) it.push(`Fonts: ${summary.fontFamilies.join(', ')}`);
     it.push('');
   }
-  it.push(`Output: ONE complete HTML document inside a fenced \`\`\`html code block. Inline all CSS / JS. Tag visible text with data-hv-text. No prose outside the block. Do NOT emit hv-options / hv-form / hv-confirm — those are over.`);
+  it.push(`Output: ONE complete HTML document. Begin your reply with \`\`\`html and end with \`\`\`. Inline all CSS / JS. Full-bleed 1920×1080. Tag visible text with data-hv-text (preserve existing keys when meaningful). No prose outside the block. Do NOT return an empty reply.`);
+  it.push('');
+  it.push(`Skeleton to extend (replace with the real content + visual style):`);
+  it.push('```html');
+  it.push(`<!doctype html>
+<html><head><meta charset="utf-8"><style>
+html,body{margin:0;height:100%;background:#000;color:#fff;overflow:hidden;font-family:system-ui,sans-serif}
+.stage{width:100vw;height:100vh;display:grid;place-items:center;text-align:center;padding:6vw}
+h1{font-size:8vw;letter-spacing:-.03em;animation:in 1s ease forwards;opacity:0;transform:translateY(24px)}
+@keyframes in{to{opacity:1;transform:none}}
+</style></head><body>
+<div class="stage"><h1 data-hv-text="headline">PLACEHOLDER</h1></div>
+</body></html>`);
+  it.push('```');
   return it.join('\n');
+}
+
+/** Pull headline / subheads / data values / palette / fonts from a frame's HTML. */
+function summariseHtmlForIterate(html: string): {
+  headline: string;
+  subheads: string[];
+  dataPoints: string[];
+  bgColors: string[];
+  fontFamilies: string[];
+} {
+  const subheads: string[] = [];
+  const dataPoints: string[] = [];
+  // Visible text in tagged elements
+  const textRe = /data-hv-text="([^"]+)"[^>]*>([^<]{1,160})</gi;
+  let m: RegExpExecArray | null;
+  let headline = '';
+  while ((m = textRe.exec(html)) !== null) {
+    const key = m[1] ?? '';
+    const val = (m[2] ?? '').trim();
+    if (!val) continue;
+    if (/headline|title|hero/i.test(key) && !headline) headline = val;
+    else if (/data|stat|value|number/i.test(key)) dataPoints.push(`${key}: ${val}`);
+    else subheads.push(`${key}: ${val}`);
+  }
+  // Body / stage background colour (rough)
+  const bgColors = Array.from(
+    html.matchAll(/background[^:]*:\s*(#[0-9a-f]{3,8}|rgb[a]?\([^)]+\)|hsla?\([^)]+\))/gi),
+  ).slice(0, 3).map((x) => x[1]!).filter(Boolean);
+  // Font families (first occurrence in css)
+  const fontFamilies = Array.from(
+    new Set(
+      Array.from(html.matchAll(/font-family\s*:\s*([^;}]+)/gi))
+        .map((x) => (x[1] ?? '').trim().slice(0, 80))
+        .filter(Boolean),
+    ),
+  ).slice(0, 2);
+  return {
+    headline,
+    subheads: subheads.slice(0, 6),
+    dataPoints: dataPoints.slice(0, 6),
+    bgColors,
+    fontFamilies,
+  };
 }
 
 /**
