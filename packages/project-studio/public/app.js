@@ -456,8 +456,11 @@ function renderAgentMenu() {
     if (a.available) tag = '';
     else if (needsLogin) tag = `<span class="mi-login" role="button" tabindex="0" data-login-agent="${esc(a.id)}">${esc(t('agent.sign_in'))}</span>`;
     else tag = `<span class="mi-tag">${esc(t('settings.agent.unavailable'))}</span>`;
-    const dis = a.available ? '' : 'disabled';
-    return `<button class="agent-menu-item${cur}" data-agent-id="${esc(a.id)}" ${dis} title="${esc(a.hint ?? '')}">
+    // NOTE: do NOT use the native `disabled` attribute — a disabled <button>
+    // swallows pointer events on its children, so the inner "Sign in" span
+    // becomes unclickable. Mark unselectable via a class and gate in JS instead.
+    const unsel = a.available ? '' : ' is-unselectable';
+    return `<button type="button" class="agent-menu-item${cur}${unsel}" data-agent-id="${esc(a.id)}" data-selectable="${a.available ? '1' : '0'}" title="${esc(a.hint ?? '')}">
       <span class="mi-dot ${a.available ? 'ok' : ''}"></span>
       <span class="mi-logo">${logo}</span>
       <span class="mi-name">${esc(a.name)}</span>${tag}
@@ -465,10 +468,10 @@ function renderAgentMenu() {
   }).join('');
   menu.querySelectorAll('.agent-menu-item').forEach((item) => {
     item.onclick = async (e) => {
-      // Login button inside a (disabled) item: don't treat as agent-select.
+      // Login button inside the item: don't treat as agent-select.
       if (e.target.closest('.mi-login')) return;
       const aid = item.dataset.agentId;
-      if (!state.selected || item.disabled) return;
+      if (!state.selected || item.dataset.selectable !== '1') return;
       try {
         await API.setAgent(state.selected.id, aid);
         state.selected = (await API.getProject(state.selected.id)).project;

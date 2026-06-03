@@ -64,8 +64,11 @@
     padding: 8px 10px; border-radius: var(--radius-sm); cursor: pointer; border: 0;
     background: transparent; color: var(--text); font: inherit; font-size: 12.5px;
     text-align: left; width: 100%; }
-  .agent-menu .agent-menu-item:hover:not(:disabled) { background: var(--bg-subtle); }
-  .agent-menu .agent-menu-item:disabled { opacity: .5; cursor: not-allowed; }
+  .agent-menu .agent-menu-item:hover:not(.is-unselectable) { background: var(--bg-subtle); }
+  /* Unselectable rows (missing CLI / needs login) are dimmed but still let the
+     inner Sign-in button receive clicks — so NOT the native :disabled. */
+  .agent-menu .agent-menu-item.is-unselectable { opacity: .5; cursor: not-allowed; }
+  .agent-menu .agent-menu-item.is-unselectable .mi-login { opacity: 1; cursor: pointer; }
   .agent-menu .agent-menu-item.current { background: var(--accent-soft); }
   .agent-menu .agent-menu-item .mi-dot { width: 7px; height: 7px; border-radius: 50%;
     flex: 0 0 auto; background: var(--text-faint); }
