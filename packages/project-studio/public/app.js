@@ -1782,10 +1782,19 @@ function renderPreview() {
   // at the design's native pixel size and is scaled to fit (scale set on resize).
   const res = p.preferences?.resolution ?? { width: 1920, height: 1080 };
   const vw = res.width || 1920, vh = res.height || 1080;
+  // Constrain the preview frame along the *long* axis so the whole frame stays
+  // contained in the (bounded-height) stage. The base CSS only limits width
+  // (width:100%; max-width:1280px) which is right for landscape, but for a
+  // portrait frame (vh>vw) that lets it grow ~2275px tall and overflow — you'd
+  // only see the top slice. For portrait, limit height instead and let width
+  // follow the aspect-ratio. Square stays width-bound.
+  const sizeStyle = vh > vw
+    ? 'width:auto;max-width:none;height:100%;max-height:100%'
+    : 'width:100%;max-width:1280px';
   // sandbox now grants same-origin so we can attach a text-edit overlay
   // from the parent window. allow-scripts keeps the page's own animations
   // running. forms / popups / top-navigation stay blocked.
-  stage.innerHTML = `<div class="preview-frame ${state.editTextMode ? 'editing' : ''}" style="aspect-ratio:${vw}/${vh}">
+  stage.innerHTML = `<div class="preview-frame ${state.editTextMode ? 'editing' : ''}" style="aspect-ratio:${vw}/${vh};${sizeStyle}">
     <iframe id="preview-iframe" sandbox="allow-scripts allow-same-origin" src="${iframeSrc}" style="width:${vw}px;height:${vh}px"></iframe>
     ${stamp ? `<div class="stamp">${esc(stamp)}</div>` : ''}
     <button class="edit-toggle" id="btn-edit-text"
