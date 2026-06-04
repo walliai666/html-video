@@ -2463,6 +2463,19 @@ async function runSplitMultiFrameGenerate(
   const pickedType = inputs.pickedType ?? '';
   const pickedStyle = inputs.pickedStyle ?? '';
   const contentTurns = inputs.contentTurns ?? [];
+  // When a template is selected, its OWN source HTML is the style ground truth —
+  // every frame must reuse its palette/typography/layout/motion. Previously
+  // split-generate only passed the template's one-line description, so a picked
+  // template (e.g. Swiss Grid: light grey + black/gold serif) came out as a
+  // generic dark theme. Read the real source once and force it into each frame.
+  let templateHtml = '';
+  if (tmpl?.__dir && tmpl.source_entry) {
+    try {
+      const { readFileSync } = await import('node:fs');
+      const p = join(tmpl.__dir, tmpl.source_entry);
+      if (existsSync(p)) templateHtml = readFileSync(p, 'utf8');
+    } catch { /* fall back to description-only */ }
+  }
   const aspect = ((collected.aspect ?? '16:9').split(/\s+/)[0] ?? '16:9');
   const frameCountReq = Math.max(2, Math.min(10, Number(collected.frame_count ?? '4') || 4));
   // Prefer per-frame pacing (total = per_frame × frames) — set by the format
@@ -2565,9 +2578,18 @@ async function runSplitMultiFrameGenerate(
     }
     fp.push(`Output: begin with \`\`\`html and end with \`\`\`. Inline CSS + JS, full-bleed ${resolution}, opens with an animation timeline. Tag visible text with data-hv-text. CDN imports (Tailwind, GSAP) fine. No prose outside the block.`);
     fp.push('');
-    fp.push(`Skeleton to extend (replace placeholder, expand styling per type / style):`);
-    fp.push('```html');
-    fp.push(`<!doctype html>
+    if (templateHtml) {
+      // A template is selected → its HTML is the REQUIRED look for every frame.
+      fp.push(`Template HTML — this is the REQUIRED visual style for THIS frame. Reuse its exact palette, background, typography, layout structure and animation approach; only swap in this frame's text/data. Do NOT invent a different theme (no generic dark background unless the template itself is dark):`);
+      fp.push('```html');
+      fp.push(templateHtml.slice(0, 4000));
+      fp.push('```');
+      fp.push('');
+      fp.push(`Keep all ${graph.nodes.length} frames visually consistent with this template so they read as one video.`);
+    } else {
+      fp.push(`Skeleton to extend (replace placeholder, expand styling per type / style):`);
+      fp.push('```html');
+      fp.push(`<!doctype html>
 <html><head><meta charset="utf-8"><style>
 html,body{margin:0;height:100%;background:#000;color:#fff;overflow:hidden;font-family:system-ui,sans-serif}
 .stage{width:100vw;height:100vh;display:grid;place-items:center;text-align:center;padding:6vw}
@@ -2576,13 +2598,14 @@ h1{font-size:8vw;letter-spacing:-.03em;animation:in 1s ease forwards;opacity:0;t
 </style></head><body>
 <div class="stage"><h1 data-hv-text="headline">PLACEHOLDER</h1></div>
 </body></html>`);
-    fp.push('```');
-    if (priorHtml && priorHtml.length > 0) {
-      fp.push('');
-      fp.push(`Visual style reference (mine for palette / typography / motion vocabulary, do not copy literally):`);
-      fp.push('```html');
-      fp.push(priorHtml.slice(0, 2400));
       fp.push('```');
+      if (priorHtml && priorHtml.length > 0) {
+        fp.push('');
+        fp.push(`Visual style reference (mine for palette / typography / motion vocabulary, do not copy literally):`);
+        fp.push('```html');
+        fp.push(priorHtml.slice(0, 2400));
+        fp.push('```');
+      }
     }
     if (i === 0 && attachments.length > 0) {
       fp.push('');
