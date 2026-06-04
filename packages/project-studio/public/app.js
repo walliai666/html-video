@@ -434,7 +434,7 @@ function renderAgentPill() {
     dot.className = 'agent-dot';
     return;
   }
-  const currentId = p.agentId ?? (state.agents.find((a) => a.available)?.id ?? 'anthropic-api');
+  const currentId = p.agentId ?? (state.agents.find((a) => a.available && a.id !== 'amr')?.id ?? 'anthropic-api');
   const a = state.agents.find((x) => x.id === currentId);
   const available = a?.available ?? false;
   label.textContent = a?.name ?? currentId;
@@ -447,7 +447,7 @@ function renderAgentPill() {
 function renderAgentMenu() {
   const menu = document.getElementById('agent-menu');
   if (!menu || !state.selected) return;
-  const currentId = state.selected.agentId ?? (state.agents.find((a) => a.available)?.id ?? 'anthropic-api');
+  const currentId = state.selected.agentId ?? (state.agents.find((a) => a.available && a.id !== 'amr')?.id ?? 'anthropic-api');
   menu.innerHTML = state.agents.map((a) => {
     const cur = a.id === currentId ? ' current' : '';
     const logo = AGENT_LOGOS[a.id] ? `<img src="${esc(AGENT_LOGOS[a.id])}" alt="" />` : '';
@@ -833,7 +833,7 @@ function wireSoundtrackPanel() {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          agentId: state.selected.agentId ?? (state.agents.find((a) => a.available)?.id ?? 'anthropic-api'),
+          agentId: state.selected.agentId ?? (state.agents.find((a) => a.available && a.id !== 'amr')?.id ?? 'anthropic-api'),
           ...(frameId && { frameId }),
         }),
       });
